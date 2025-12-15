@@ -38,18 +38,55 @@ class SubtitleDetect:
 
     @cached_property
     def text_detector(self):
-        import paddle
-        paddle.disable_signal_handler()
-        from paddleocr.tools.infer import utility
-        from paddleocr.tools.infer.predict_det import TextDetector
-        # 获取参数对象
-        importlib.reload(config)
-        args = utility.parse_args()
-        args.det_algorithm = 'DB'
-        args.det_model_dir = self.convertToOnnxModelIfNeeded(config.DET_MODEL_PATH)
-        args.use_onnx=len(config.ONNX_PROVIDERS) > 0
-        args.onnx_providers=config.ONNX_PROVIDERS
-        return TextDetector(args)
+        from paddleocr import PaddleOCR
+        import numpy as np
+        import logging
+        import os
+        
+        # 屏蔽日志
+        logging.getLogger("ppocr").setLevel(logging.WARNING)
+
+        # 检查模型路径
+        if not os.path.exists(config.DET_MODEL_PATH):
+            print(f"[Warning] 本地模型路径不存在: {config.DET_MODEL_PATH}，PaddleOCR 将尝试自动下载")
+            model_dir = None
+        else:
+            print(f"[Info] 使用本地模型路径: {config.DET_MODEL_PATH}")
+            model_dir = config.DET_MODEL_PATH
+
+        # 初始化 PaddleOCR
+        ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang="ch",
+            show_log=False,
+            # 优先使用 GPU，如果没检测到 cuda 则自动回退 CPU
+            use_gpu=True, 
+            
+            # 【关键修改】强制关闭 ONNX
+            # 因为我们已经安装了 paddlepaddle-gpu，原生推理更稳定
+            # 开启 ONNX 会导致 Protobuf 解析错误
+            use_onnx=False,
+            
+            # 指定本地模型路径
+            det_model_dir=model_dir
+        )
+
+        def predict_wrapper(img):
+            try:
+                # 核心调用
+                result = ocr.ocr(img, rec=False, cls=False)
+            except Exception as e:
+                print(f"[Error] PaddleOCR detection error: {e}")
+                result = None
+
+            dt_boxes = []
+            if result is not None:
+                if len(result) > 0 and result[0] is not None:
+                    dt_boxes = result[0]
+            
+            return np.array(dt_boxes), 0
+
+        return predict_wrapper
 
     def detect_subtitle(self, img):
         dt_boxes, elapse = self.text_detector(img)
@@ -58,22 +95,22 @@ class SubtitleDetect:
     @staticmethod
     def get_coordinates(dt_box):
         """
-        从返回的检测框中获取坐标
-        :param dt_box 检测框返回结果
-        :return list 坐标点列表
+        [必须修改] 获取检测框的最小外包矩形，防止倾斜导致坐标错误
         """
         coordinate_list = list()
         if isinstance(dt_box, list):
             for i in dt_box:
                 i = list(i)
-                (x1, y1) = int(i[0][0]), int(i[0][1])
-                (x2, y2) = int(i[1][0]), int(i[1][1])
-                (x3, y3) = int(i[2][0]), int(i[2][1])
-                (x4, y4) = int(i[3][0]), int(i[3][1])
-                xmin = max(x1, x4)
-                xmax = min(x2, x3)
-                ymin = max(y1, y2)
-                ymax = min(y3, y4)
+                # 获取四个点的坐标
+                x_list = [int(i[0][0]), int(i[1][0]), int(i[2][0]), int(i[3][0])]
+                y_list = [int(i[0][1]), int(i[1][1]), int(i[2][1]), int(i[3][1])]
+                
+                # 使用 min/max 确保无论 OCR 返回的框是否倾斜，都能完整包裹住文字
+                xmin = min(x_list)
+                xmax = max(x_list)
+                ymin = min(y_list)
+                ymax = max(y_list)
+                
                 coordinate_list.append((xmin, xmax, ymin, ymax))
         return coordinate_list
 
@@ -366,7 +403,10 @@ class SubtitleDetect:
                         next_start = ns
                         break
                 # 确定新的扩展起点和终点
-                new_start = max(start - (target_length - 1) // 2, prev_end + 1)
+                calc_start = start - (target_length - 1) // 2
+                new_start = max(calc_start, prev_end + 1, 1)  # 这里加了个 1
+                #new_start = max(start - (target_length - 1) // 2, prev_end + 1)
+
                 new_end = min(start + (target_length - 1) // 2, next_start - 1)
                 # 如果新的扩展终点在起点前面，说明没有足够空间来进行扩展
                 if new_end < new_start:
@@ -563,8 +603,18 @@ class SubtitleDetect:
 
 
 class SubtitleRemover:
-    def __init__(self, vd_path, sub_area=None, gui_mode=False):
-        importlib.reload(config)
+    def __init__(self, vd_path, sub_area=None, gui_mode=False, mode=None):
+        # 调试打印：看看传入的 mode 到底是不是 None
+        print(f"DEBUG: SubtitleRemover 初始化, 传入 mode={mode}")
+        
+        # 这里的逻辑必须是这样
+        self.mode = mode if mode else config.MODE
+        
+        # 调试打印：看看最终确定的 self.mode 是什么
+        print(f"DEBUG: 最终确定 self.mode={self.mode}")
+
+        self.mode = mode if mode else config.MODE
+        #importlib.reload(config)
         # 线程锁
         self.lock = threading.RLock()
         # 用户指定的字幕区域位置
@@ -724,7 +774,19 @@ class SubtitleRemover:
                             continue
                         elif len(temp_frames) == 1:
                             inner_index += 1
-                            single_mask = create_mask(self.mask_size, sub_list[index])
+                            # === 修改开始：单帧膨胀逻辑 ===
+                            expanded_areas = []
+                            pad = config.SUBTITLE_AREA_DEVIATION_PIXEL
+                            for area in sub_list[index]:
+                                xmin, xmax, ymin, ymax = area
+                                ymin = max(0, ymin - pad)
+                                ymax = min(self.frame_height, ymax + pad)
+                                xmin = max(0, xmin - pad)
+                                xmax = min(self.frame_width, xmax + pad)
+                                expanded_areas.append((xmin, xmax, ymin, ymax))
+                            single_mask = create_mask(self.mask_size, expanded_areas)
+                            # === 修改结束 ===
+                            
                             if self.lama_inpaint is None:
                                 self.lama_inpaint = LamaInpaint()
                             inpainted_frame = self.lama_inpaint(frame, single_mask)
@@ -735,11 +797,29 @@ class SubtitleRemover:
                         else:
                             # 将读取的视频帧分批处理
                             # 1. 获取当前批次使用的mask
-                            mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                            
+                            # === 修改开始：批次Mask膨胀逻辑 ===
+                            expanded_areas = []
+                            pad = config.SUBTITLE_AREA_DEVIATION_PIXEL
+                            # ProPainter 逻辑比较特殊，它这里默认是用 start_frame_no 的 mask 代表这一整段
+                            # 为了保证覆盖，我们同样进行膨胀
+                            if start_frame_no in sub_list:
+                                for area in sub_list[start_frame_no]:
+                                    xmin, xmax, ymin, ymax = area
+                                    ymin = max(0, ymin - pad)
+                                    ymax = min(self.frame_height, ymax + pad)
+                                    xmin = max(0, xmin - pad)
+                                    xmax = min(self.frame_width, xmax + pad)
+                                    expanded_areas.append((xmin, xmax, ymin, ymax))
+                            
+                            mask = create_mask(self.mask_size, expanded_areas)
+                            # === 修改结束 ===
+
                             for batch in batch_generator(temp_frames, config.PROPAINTER_MAX_LOAD_NUM):
                                 # 2. 调用批推理
                                 if len(batch) == 1:
-                                    single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
+                                    # 单帧兜底逻辑也需要膨胀
+                                    single_mask = mask # 直接复用上面生成的 mask 即可
                                     if self.lama_inpaint is None:
                                         self.lama_inpaint = LamaInpaint()
                                     inpainted_frame = self.lama_inpaint(frame, single_mask)
@@ -765,6 +845,16 @@ class SubtitleRemover:
         print('[Processing] start removing subtitles...')
         if self.sub_area is not None:
             ymin, ymax, xmin, xmax = self.sub_area
+            print(f"DEBUG: Original sub_area: {ymin}, {ymax}, {xmin}, {xmax}")
+            
+            # 2. 【关键步骤】手动应用膨胀逻辑
+            # 向四周扩大选区，彻底盖住黄色光晕
+            ymin = max(0, ymin - pad)
+            ymax = min(self.frame_height, ymax + pad)
+            xmin = max(0, xmin - pad)
+            xmax = min(self.frame_width, xmax + pad)
+            
+            print(f"DEBUG: Expanded sub_area: {ymin}, {ymax}, {xmin}, {xmax}")
         else:
             print('[Info] No subtitle area has been set. Video will be processed in full screen. As a result, the final outcome might be suboptimal.')
             ymin, ymax, xmin, xmax = 0, self.frame_height, 0, self.frame_width
@@ -774,78 +864,278 @@ class SubtitleRemover:
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
 
     def sttn_mode(self, tbar):
-        # 是否跳过字幕帧寻找
-        if config.STTN_SKIP_DETECTION:
-            # 若跳过则世界使用sttn模式
-            self.sttn_mode_with_no_detection(tbar)
-        else:
-            print('use sttn mode')
-            sttn_inpaint = STTNInpaint()
-            sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
-            continuous_frame_no_list = self.sub_detector.find_continuous_ranges_with_same_mask(sub_list)
-            print(continuous_frame_no_list)
-            continuous_frame_no_list = self.sub_detector.filter_and_merge_intervals(continuous_frame_no_list)
-            print(continuous_frame_no_list)
-            start_end_map = dict()
-            for interval in continuous_frame_no_list:
-                start, end = interval
-                start_end_map[start] = end
-            current_frame_index = 0
-            print('[Processing] start removing subtitles...')
+        """
+        STTN 模式（最终稳定版）
+        核心思想：
+        - union_mask：只用于计算 STTN 的 inpaint_area
+        - mask_getter：决定每一帧是否真的使用 STTN 结果
+        """
+        print("\n" + "=" * 50)
+        print("【STTN】Per-frame Mask Inpainting Mode")
+        print("=" * 50 + "\n")
+
+        # 1. 字幕检测
+        sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
+
+        if not sub_list:
+            print("[STTN] No subtitles detected, copy original video.")
             while True:
                 ret, frame = self.video_cap.read()
-                # 如果读取到为，则结束
                 if not ret:
                     break
-                current_frame_index += 1
-                # 判断当前帧号是不是字幕区间开始, 如果不是，则直接写
-                if current_frame_index not in start_end_map.keys():
-                    self.video_writer.write(frame)
-                    print(f'write frame: {current_frame_index}')
-                    self.update_progress(tbar, increment=1)
-                    if self.gui_mode:
-                        self.preview_frame = cv2.hconcat([frame, frame])
-                # 如果是区间开始，则找到尾巴
+                self.video_writer.write(frame)
+                self.update_progress(tbar, 1)
+            return
+
+        # 2. 自适应 pad（720p / 1080p 通用）
+        pad_y = max(10, min(28, int(self.frame_height * 0.02)))
+        pad_x = max(14, min(42, int(self.frame_height * 0.03)))
+
+        # 3. 构建时域稳定的 per-frame mask dict
+        frames = sorted(sub_list.keys())
+        final_mask_dict = {}
+
+        current_group = [frames[0]]
+        groups = []
+
+        for i in range(1, len(frames)):
+            if frames[i] - frames[i - 1] > 5:
+                groups.append(current_group)
+                current_group = []
+            current_group.append(frames[i])
+        groups.append(current_group)
+
+        for group in groups:
+            all_boxes = []
+            for f in group:
+                all_boxes.extend(sub_list[f])
+
+            if not all_boxes:
+                continue
+
+            # 按 Y 中心聚类（区分不同行字幕）
+            clusters = []
+            for box in all_boxes:
+                cy = (box[2] + box[3]) / 2
+                for c in clusters:
+                    if abs(c["cy"] - cy) < 100:
+                        c["boxes"].append(box)
+                        break
                 else:
-                    start_frame_index = current_frame_index
-                    end_frame_index = start_end_map[current_frame_index]
-                    print(f'processing frame {start_frame_index} to {end_frame_index}')
-                    # 用于存储需要去字幕的视频帧
-                    frames_need_inpaint = list()
-                    frames_need_inpaint.append(frame)
-                    inner_index = 0
-                    # 接着往下读，直到读取到尾巴
-                    for j in range(end_frame_index - start_frame_index):
-                        ret, frame = self.video_cap.read()
-                        if not ret:
-                            break
-                        current_frame_index += 1
-                        frames_need_inpaint.append(frame)
-                    mask_area_coordinates = []
-                    # 1. 获取当前批次的mask坐标全集
-                    for mask_index in range(start_frame_index, end_frame_index):
-                        if mask_index in sub_list.keys():
-                            for area in sub_list[mask_index]:
-                                xmin, xmax, ymin, ymax = area
-                                # 判断是不是非字幕区域(如果宽大于长，则认为是错误检测)
-                                if (ymax - ymin) - (xmax - xmin) > config.THRESHOLD_HEIGHT_WIDTH_DIFFERENCE:
-                                    continue
-                                if area not in mask_area_coordinates:
-                                    mask_area_coordinates.append(area)
-                    # 1. 获取当前批次使用的mask
-                    mask = create_mask(self.mask_size, mask_area_coordinates)
-                    print(f'inpaint with mask: {mask_area_coordinates}')
-                    for batch in batch_generator(frames_need_inpaint, config.STTN_MAX_LOAD_NUM):
-                        # 2. 调用批推理
-                        if len(batch) >= 1:
-                            inpainted_frames = sttn_inpaint(batch, mask)
-                            for i, inpainted_frame in enumerate(inpainted_frames):
-                                self.video_writer.write(inpainted_frame)
-                                print(f'write frame: {start_frame_index + inner_index} with mask')
-                                inner_index += 1
-                                if self.gui_mode:
-                                    self.preview_frame = cv2.hconcat([batch[i], inpainted_frame])
-                        self.update_progress(tbar, increment=len(batch))
+                    clusters.append({"cy": cy, "boxes": [box]})
+
+            stable_boxes = []
+            for c in clusters:
+                xs = [b[0] for b in c["boxes"]] + [b[1] for b in c["boxes"]]
+                ys = [b[2] for b in c["boxes"]] + [b[3] for b in c["boxes"]]
+
+                xmin = max(0, min(xs) - pad_x)
+                xmax = min(self.frame_width, max(xs) + pad_x)
+                ymin = max(0, min(ys) - pad_y)
+                ymax = min(self.frame_height, max(ys) + pad_y)
+
+                stable_boxes.append((xmin, xmax, ymin, ymax))
+
+            for f in group:
+                final_mask_dict[f] = stable_boxes
+
+        # 4. union mask（只用于 inpaint_area）
+        all_static_boxes = []
+        for boxes in final_mask_dict.values():
+            all_static_boxes.extend(boxes)
+
+        union_mask = create_mask(self.mask_size, all_static_boxes)
+
+        # 5. per-frame mask getter（决定是否修）
+        def mask_getter(frame_no: int):
+            boxes = final_mask_dict.get(frame_no, [])
+            return create_mask(self.mask_size, boxes)
+
+        # 6. 启动 STTN
+        sttn_video_inpaint = STTNVideoInpaint(self.video_path)
+        sttn_video_inpaint(
+            input_mask=union_mask,
+            input_sub_remover=self,
+            tbar=tbar,
+            mask_getter=mask_getter
+        )
+
+
+    # def sttn_mode(self, tbar):
+    #     """
+    #     STTN模式主入口 - [最终稳定版]
+    #     修复策略：时域平滑 + 激进膨胀 + 强制稳定Mask
+    #     """
+    #     print("\n" + "="*50)
+    #     print("【执行】时域稳定修复模式 (Temporal Stable Inpainting)")
+    #     print("="*50 + "\n")
+
+    #     # if config.STTN_SKIP_DETECTION:
+    #     #     self.sttn_mode_with_no_detection(tbar)
+    #     #     return
+
+    #     # 1. 检测字幕
+    #     print('Step 1: 扫描全视频字幕...')
+    #     sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
+        
+    #     if not sub_list:
+    #         print("警告：未检测到任何字幕！")
+    #         while True:
+    #             ret, frame = self.video_cap.read()
+    #             if not ret: break
+    #             self.video_writer.write(frame)
+    #             self.update_progress(tbar, increment=1)
+    #         return
+
+    #     # 2. 【关键步骤】时域平滑与合并
+    #     # 目的是：算出每一行字幕在出现期间的“最大范围”，防止Mask忽大忽小导致泄露
+    #     print("Step 2: 计算全局最大遮罩范围...")
+        
+    #     # 参数设置
+    #     # 激进的膨胀参数，专门针对带光晕的字幕
+    #     pad_x = 50  # 左右多扩40像素
+    #     pad_y = 40  # 上下多扩30像素
+        
+    #     # 将 sub_list 转换为列表以便处理
+    #     frames_with_subs = sorted(list(sub_list.keys()))
+    #     if not frames_with_subs:
+    #         return
+
+    #     # 简单的聚类算法，将连续的帧视为同一组字幕
+    #     groups = []
+    #     if frames_with_subs:
+    #         current_group = [frames_with_subs[0]]
+    #         for i in range(1, len(frames_with_subs)):
+    #             # 如果帧号中断超过 5 帧，视为下一句字幕
+    #             if frames_with_subs[i] - frames_with_subs[i-1] > 5:
+    #                 groups.append(current_group)
+    #                 current_group = []
+    #             current_group.append(frames_with_subs[i])
+    #         groups.append(current_group)
+
+    #     # 构建最终的 Mask 字典
+    #     # key: frame_no, value: list of (xmin, xmax, ymin, ymax)
+    #     final_mask_dict = {}
+
+    #     for group in groups:
+    #         if not group: continue
+            
+    #         # 1. 收集这一组时间段内，所有检测到的框
+    #         all_boxes_in_group = []
+    #         for f in group:
+    #             all_boxes_in_group.extend(sub_list[f])
+            
+    #         # 2. 分离这一组里的不同区域（比如顶部标题和底部字幕）
+    #         # 我们通过 Y 轴坐标来聚类
+    #         y_clusters = [] 
+    #         for box in all_boxes_in_group:
+    #             # box: xmin, xmax, ymin, ymax
+    #             cy = (box[2] + box[3]) / 2  # 中心点Y
+    #             found_cluster = False
+    #             for cluster in y_clusters:
+    #                 # 如果中心点距离在 100 像素内，视为同一行
+    #                 if abs(cluster['center_y'] - cy) < 100:
+    #                     cluster['boxes'].append(box)
+    #                     # 更新聚类中心
+    #                     cluster['center_y'] = (cluster['center_y'] * cluster['count'] + cy) / (cluster['count'] + 1)
+    #                     cluster['count'] += 1
+    #                     found_cluster = True
+    #                     break
+    #             if not found_cluster:
+    #                 y_clusters.append({'center_y': cy, 'boxes': [box], 'count': 1})
+            
+    #         # 3. 对每一行字幕，计算“最大并集框” (Union Box)
+    #         # 这就是消除“鬼影”的核心：只要有一帧检测到了完整的字，所有帧都用那个最大的框
+    #         final_boxes_for_this_group = []
+    #         for cluster in y_clusters:
+    #             c_boxes = cluster['boxes']
+    #             # 获取这一行在所有帧里出现过的最左、最右、最上、最下坐标
+    #             u_xmin = min([b[0] for b in c_boxes])
+    #             u_xmax = max([b[1] for b in c_boxes])
+    #             u_ymin = min([b[2] for b in c_boxes])
+    #             u_ymax = max([b[3] for b in c_boxes])
+                
+    #             # 应用激进膨胀
+    #             f_xmin = max(0, u_xmin - pad_x)
+    #             f_xmax = min(self.frame_width, u_xmax + pad_x)
+    #             f_ymin = max(0, u_ymin - pad_y)
+    #             f_ymax = min(self.frame_height, u_ymax + pad_y)
+                
+    #             final_boxes_for_this_group.append((f_xmin, f_xmax, f_ymin, f_ymax))
+            
+    #         # 4. 将计算好的固定Mask应用到这一组的所有帧
+    #         for f in group:
+    #             final_mask_dict[f] = final_boxes_for_this_group
+
+    #     # 3. 生成 Mask 序列
+    #     # STTN 需要每一帧的 Mask，这里我们需要把 dict 转换成 STTNVideoInpaint 能识别的格式
+    #     # 但为了复用现有逻辑，我们这里生成一个全局静态 Mask 列表给 create_mask
+    #     # 注意：STTNInpaint 内部会根据帧号去读，但这里我们简化处理，
+    #     # 我们需要重写一个 generator 或者直接传 dict 进去比较麻烦。
+    #     # 最简单的方法：修改 STTNVideoInpaint 里的逻辑，或者在这里生成一个 mask list
+        
+    #     # 修正：由于 STTNVideoInpaint 默认逻辑比较死板，我们这里生成一个覆盖所有帧的 mask_list
+    #     # 这会导致性能下降（每帧都算），但效果最好。
+        
+    #     # 既然不能直接改 STTN 内部循环，我们用一种 Hack 的方法：
+    #     # 我们把 mask 画在每一帧上？不行。
+    #     # 我们构建一个 mask_generator。
+        
+    #     print("Step 3: 启动 STTN 引擎...")
+        
+    #     # 定义一个内部回调，用于获取每一帧的 mask
+    #     def get_mask_for_frame(frame_idx):
+    #         # +1 因为 frame_no 通常从1开始
+    #         current_no = frame_idx + 1
+    #         if current_no in final_mask_dict:
+    #             return create_mask(self.mask_size, final_mask_dict[current_no])
+    #         else:
+    #             # 如果这一帧没字幕，返回全黑
+    #             return create_mask(self.mask_size, [])
+
+    #     # 实例化并运行
+    #     sttn_video_inpaint = STTNVideoInpaint(self.video_path)
+        
+    #     # 我们需要一点点 Hack，把处理好的 mask 逻辑注入进去
+    #     # 或者我们直接生成一个巨大的 Mask 视频？太慢。
+    #     # 让我们使用最原始的方法：传递一个 mask_path 或者 mask_generator
+    #     # 鉴于你的代码结构，最稳妥的方式是把 final_mask_dict 传给 STTNVideoInpaint
+    #     # 但我没有 STTNVideoInpaint 的源码权限，所以我只能假设它接受 input_mask
+        
+    #     # 如果 STTNVideoInpaint 只接受一张静态 mask (input_mask 参数)：
+    #     # 那我们就必须把 final_mask_dict 里所有的框都画在一张图上
+    #     # 缺点：即使字幕消失了，Mask还在，会修复空气，导致模糊。
+    #     # 优点：绝对不会有残留。
+        
+    #     # === 方案 A：生成一张包含所有时间段字幕的静态大 Mask (最稳，但也最暴力) ===
+    #     all_static_boxes = []
+    #     for f, boxes in final_mask_dict.items():
+    #         for b in boxes:
+    #             if b not in all_static_boxes:
+    #                 all_static_boxes.append(b)
+        
+    #     # 过滤一下重叠的
+    #     mask = create_mask(self.mask_size, all_static_boxes)
+        
+    #     # 诊断图片
+    #     debug_mask_path = os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_stable_mask.png')
+    #     cv2.imwrite(debug_mask_path, mask)
+    #     print(f"【诊断】Mask已保存至: {debug_mask_path} (此处应包含所有出现过的字幕区域)")
+
+    #     # sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
+    #     union_mask = create_mask(self.mask_size, all_static_boxes)
+
+    #     def mask_getter(frame_no: int):
+    #         # frame_no 按你 main.py 的逻辑是从 1 开始
+    #         boxes = final_mask_dict.get(frame_no, [])
+    #         return create_mask(self.mask_size, boxes)
+
+    #     sttn_video_inpaint(
+    #         input_mask=union_mask,
+    #         input_sub_remover=self,
+    #         tbar=tbar,
+    #         mask_getter=mask_getter
+    #     )
 
     def lama_mode(self, tbar):
         print('use lama mode')
@@ -861,7 +1151,23 @@ class SubtitleRemover:
             original_frame = frame
             index += 1
             if index in sub_list.keys():
-                mask = create_mask(self.mask_size, sub_list[index])
+                #mask = create_mask(self.mask_size, sub_list[index])
+                # ============= 修改开始：加入Mask膨胀逻辑 =============
+                expanded_areas = []
+                for area in sub_list[index]:
+                    xmin, xmax, ymin, ymax = area
+                    pad = config.SUBTITLE_AREA_DEVIATION_PIXEL
+                    # 强制扩大选区
+                    ymin = max(0, ymin - pad)
+                    ymax = min(self.frame_height, ymax + pad)
+                    xmin = max(0, xmin - pad)
+                    xmax = min(self.frame_width, xmax + pad)
+                    
+                    expanded_areas.append((xmin, xmax, ymin, ymax))
+                
+                # 使用扩大后的区域生成 Mask
+                mask = create_mask(self.mask_size, expanded_areas)
+                # ============= 修改结束 =============
                 if config.LAMA_SUPER_FAST:
                     frame = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
                 else:
@@ -898,13 +1204,22 @@ class SubtitleRemover:
             tbar.update(1)
             self.progress_total = 100
         else:
-            # 精准模式下，获取场景分割的帧号，进一步切割
-            if config.MODE == config.InpaintMode.PROPAINTER:
+            current_mode_str = self.mode.value if hasattr(self.mode, 'value') else str(self.mode)
+            
+            # 打印最终用来判断的字符串，确保万无一失
+            print(f"DEBUG: 正在进行模式分发，当前模式值='{current_mode_str}'")
+
+            # 2. 直接与字符串常量进行比较 (Robust!)
+            if current_mode_str == 'propainter':
+                print("DEBUG: 命中 Propainter 模式")
                 self.propainter_mode(tbar)
-            elif config.MODE == config.InpaintMode.STTN:
+            elif current_mode_str == 'sttn':
+                print("DEBUG: 命中 STTN 模式")
                 self.sttn_mode(tbar)
             else:
+                print("DEBUG: 未命中特定模式，进入 Lama/Default 模式")
                 self.lama_mode(tbar)
+
         self.video_cap.release()
         self.video_writer.release()
         if not self.is_picture:
